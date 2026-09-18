@@ -8,7 +8,15 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 
 from states import SettingsFSM
-from database import get_user, get_couple, get_partner, update_user, _fetchone, _fetchall
+from database import (
+    get_user,
+    get_couple,
+    get_partner,
+    update_user,
+    _fetchone,
+    _fetchall,
+    _execute,
+)
 from keyboards import kb_back
 from utils.helpers import safe_edit, send_to, cb_parts
 
@@ -167,9 +175,9 @@ async def dates_add_value(message: Message, state: FSMContext):
     title = data.get("date_title")
 
     # Автоназвания для birthday / anniversary
-    partner_name = user.get("partner_name") or "партнёра"
+    my_name = user.get("name") or "меня"
     if date_type == "birthday":
-        title = title or f"День рождения {partner_name}"
+        title = title or f"День рождения {my_name}"
     elif date_type == "anniversary":
         title = title or "Годовщина отношений"
     else:
@@ -315,20 +323,24 @@ async def set_time(call: CallbackQuery):
     f_time = settings["friday_time"] if settings else "18:00"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"❓ Вопрос дня — {q_time}", callback_data="set:time:q")],
-        [InlineKeyboardButton(text=f"🖤 Пятница — {f_time}", callback_data="set:time:f")],
+        [InlineKeyboardButton(
+            text=f"❓ Вопрос дня — {q_time}",
+            callback_data="set:time:q",
+        )],
+        [InlineKeyboardButton(
+            text=f"🖤 Пятница — {f_time}",
+            callback_data="set:time:f",
+        )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:settings")],
     ])
     await safe_edit(
         call,
         "🕐 <b>Время уведомлений</b>\n\n"
-        "Это время, когда бот присылает автоматические сообщения.\n\n"
-        f"❓ Вопрос дня — ежедневно в {q_time}\n"
-        f"🖤 Напоминание о Пятнице — каждую пятницу в {f_time}",
+        "Выбери, во сколько присылать.\n"
+        "Только целые часы: <b>10:00</b>, <b>11:00</b>, <b>18:00</b>.",
         reply_markup=kb,
     )
     await call.answer()
-
 
 @router.callback_query(F.data == "set:time:q")
 async def set_time_question(call: CallbackQuery, state: FSMContext):
@@ -336,11 +348,11 @@ async def set_time_question(call: CallbackQuery, state: FSMContext):
     await state.update_data(time_field="question_time")
     await safe_edit(
         call,
-        "❓ Во сколько присылать <b>вопрос дня</b>?\n\n"
-        "Формат: <b>ЧЧ:ММ</b> (например, 10:00)",
+        "❓ <b>Во сколько присылать вопрос дня?</b>\n\n"
+        "Напиши в формате <b>ЧЧ:00</b>.\n"
+        "Например: <b>10:00</b> или <b>20:00</b>.",
     )
     await call.answer()
-
 
 @router.callback_query(F.data == "set:time:f")
 async def set_time_friday(call: CallbackQuery, state: FSMContext):
@@ -348,8 +360,9 @@ async def set_time_friday(call: CallbackQuery, state: FSMContext):
     await state.update_data(time_field="friday_time")
     await safe_edit(
         call,
-        "🖤 Во сколько напоминать о <b>Пятнице желаний</b>?\n\n"
-        "Формат: <b>ЧЧ:ММ</b> (например, 18:00)",
+        "🖤 <b>Во сколько напоминать о Пятнице?</b>\n\n"
+        "Напиши в формате <b>ЧЧ:00</b>.\n"
+        "Например: <b>10:00</b> или <b>18:00</b>.",
     )
     await call.answer()
 
@@ -358,15 +371,28 @@ async def set_time_friday(call: CallbackQuery, state: FSMContext):
 async def set_time_save(message: Message, state: FSMContext):
     if message.from_user is None:
         return
-    value = (message.text or "").strip()
-    # простая проверка ЧЧ:ММ
-    parts = value.split(":")
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        await message.answer("Формат: ЧЧ:ММ (например, 10:00)")
-        return
-    hh, mm = int(parts[0]), int(parts[1])
-    if not (0 <= hh < 24 and 0 <= mm < 60):
-        await message.answer("Некорректное время.")
+
+    raw = (message.text or "").strip()
+
+    # Проверка формата ЧЧ:00
+    valid = False
+    value = ""
+
+    if len(raw) == 5 and raw[2] == ":":
+        hh = raw[:2]
+        mm = raw[3:]
+        if hh.isdigit() and mm == "00":
+            h = int(hh)
+            if 0 <= h <= 23:
+                valid = True
+                value = f"{h:02d}:00"
+
+    if not valid:
+        await message.answer(
+            "❌ Неверный формат.\n\n"
+            "Напиши так: <b>10:00</b> или <b>18:00</b>.\n"
+            "Только целые часы."
+        )
         return
 
     user = await get_user(message.from_user.id)
@@ -379,14 +405,13 @@ async def set_time_save(message: Message, state: FSMContext):
     field = data.get("time_field", "question_time")
     await state.clear()
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"UPDATE settings SET {field}=? WHERE couple_id=?",
-            (value, user["couple_id"]),
-        )
-        await db.commit()
+    await _execute(
+        f"UPDATE settings SET {field}=? WHERE couple_id=?",
+        (value, user["couple_id"]),
+    )
 
-    await message.answer(f"✅ Сохранено: {value}")
+    name = "Вопрос дня" if field == "question_time" else "Пятница"
+    await message.answer(f"✅ {name}: <b>{value}</b>")
 
 
 # =========================================================
