@@ -17,16 +17,14 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 # =========================================================
-#  КЭШИ (для оптимизации запросов)
+#  КЭШИ
 # =========================================================
 
-# Кэш настроек пар: {couple_id: (settings_dict, timestamp)}
 _settings_cache: dict[int, tuple[dict, float]] = {}
-_SETTINGS_TTL = 300   # 5 минут
+_SETTINGS_TTL = 3600   # 1 час (раньше 5 минут — реже проверяем)
 
-# Кэш TZ: {couple_id: (ZoneInfo, timestamp)}
 _tz_cache: dict[int, tuple[ZoneInfo, float]] = {}
-_TZ_TTL = 3600   # 1 час
+_TZ_TTL = 86400   # 24 часа (TZ не меняется почти никогда)
 
 
 def _cache_valid(ts: float, ttl: int) -> bool:
@@ -34,15 +32,11 @@ def _cache_valid(ts: float, ttl: int) -> bool:
 
 
 def _cleanup_caches() -> None:
-    """Удаляет устаревшие записи из кэшей."""
     now = monotonic()
-    _settings_cache_copy = dict(_settings_cache)
-    for cid, (_, ts) in _settings_cache_copy.items():
+    for cid, (_, ts) in list(_settings_cache.items()):
         if (now - ts) > _SETTINGS_TTL:
             _settings_cache.pop(cid, None)
-
-    _tz_cache_copy = dict(_tz_cache)
-    for cid, (_, ts) in _tz_cache_copy.items():
+    for cid, (_, ts) in list(_tz_cache.items()):
         if (now - ts) > _TZ_TTL:
             _tz_cache.pop(cid, None)
 
@@ -53,15 +47,15 @@ def _cleanup_caches() -> None:
 
 def setup_scheduler(bot) -> None:
     scheduler.add_job(
-        tick_minute,
-        CronTrigger(minute="*"),
+        tick_hourly,
+        CronTrigger(minute="0"),         # каждый час в :00
         args=[bot],
-        id="tick_minute",
+        id="tick_hourly",
         replace_existing=True,
     )
     scheduler.add_job(
         remind_pending,
-        CronTrigger(minute=0),
+        CronTrigger(minute=0, hour="*/4"),   # раз в 4 часа
         args=[bot],
         id="remind_pending",
         replace_existing=True,
@@ -74,7 +68,7 @@ def setup_scheduler(bot) -> None:
         replace_existing=True,
     )
     scheduler.start()
-    logger.info("Планировщик запущен (UTC-тик, TZ пары учитывается)")
+    logger.info("Планировщик запущен (раз в час, TZ пары учитывается)")
 
 
 # =========================================================
@@ -109,7 +103,6 @@ async def _get_couple_users(couple_id: int) -> list[dict]:
 
 
 async def _get_settings(couple_id: int) -> dict:
-    """С кэшем на 5 минут."""
     now = monotonic()
     cached = _settings_cache.get(couple_id)
     if cached and _cache_valid(cached[1], _SETTINGS_TTL):
@@ -140,7 +133,6 @@ async def _get_settings(couple_id: int) -> dict:
 
 
 async def _get_couple_tz(couple_id: int) -> ZoneInfo:
-    """С кэшем на 1 час."""
     now = monotonic()
     cached = _tz_cache.get(couple_id)
     if cached and _cache_valid(cached[1], _TZ_TTL):
@@ -175,47 +167,42 @@ async def _safe_send(bot, chat_id: int, text: str, reply_markup=None) -> None:
 
 
 # =========================================================
-#  TICK MINUTE
+#  TICK HOURLY (раз в час)
 # =========================================================
 
-async def tick_minute(bot) -> None:
-    # Кэш «уже отправлено» — по датам
-    if not hasattr(tick_minute, "_sent"):
-        tick_minute._sent = {}   # type: ignore[attr-defined]
-    sent_by_date: dict[str, set] = tick_minute._sent  # type: ignore[attr-defined]
+async def tick_hourly(bot) -> None:
+    # Кэш отправленного — по датам
+    if not hasattr(tick_hourly, "_sent"):
+        tick_hourly._sent = {}   # type: ignore[attr-defined]
+    sent_by_date: dict[str, set] = tick_hourly._sent  # type: ignore[attr-defined]
 
     now_utc = datetime.utcnow()
     today_utc = now_utc.strftime("%Y-%m-%d")
 
-    # Очистка старых дат (старше 2 дней)
     cutoff = (now_utc - timedelta(days=2)).strftime("%Y-%m-%d")
     for d in list(sent_by_date.keys()):
         if d < cutoff:
             del sent_by_date[d]
 
-    # Текущий набор для сегодня
     sent: set = sent_by_date.setdefault(today_utc, set())
 
-    # Очистка кэшей раз в тик
     _cleanup_caches()
 
     couples = await _get_active_couples()
     for c in couples:
         couple_id = c["id"]
-
-        # Из кэша — быстро
         tz = await _get_couple_tz(couple_id)
         settings = await _get_settings(couple_id)
 
         now = datetime.now(tz)
-        hhmm = now.strftime("%H:%M")
+        hour_str = now.strftime("%H:00")   # "10:00", "11:00", ...
         today = now.strftime("%Y-%m-%d")
         weekday = now.weekday()
 
         # --- Вопрос дня ---
-        q_key = f"q:{couple_id}:{today}"
+        q_key = f"q:{couple_id}:{today}:{hour_str}"
         if q_key not in sent:
-            if settings.get("question_time", "10:00") == hhmm:
+            if settings.get("question_time", "10:00") == hour_str:
                 if not settings.get("tests_paused", 0):
                     from handlers.question import send_daily_question
                     await send_daily_question(bot, couple_id)
@@ -224,7 +211,7 @@ async def tick_minute(bot) -> None:
         # --- Пятница ---
         if weekday == 4:
             fm_key = f"fm:{couple_id}:{today}"
-            if fm_key not in sent and hhmm == "10:00":
+            if fm_key not in sent and hour_str == "10:00":
                 await friday_morning_reminder(bot, couple_id)
                 sent.add(fm_key)
 
@@ -232,13 +219,13 @@ async def tick_minute(bot) -> None:
             if f_key not in sent:
                 if not settings.get("friday_mode", 1):
                     sent.add(f_key)
-                elif settings.get("friday_time", "18:00") == hhmm:
+                elif settings.get("friday_time", "18:00") == hour_str:
                     await run_friday(bot, couple_id)
                     sent.add(f_key)
 
         # --- Даты + статус ---
         d_key = f"d:{couple_id}:{today}"
-        if d_key not in sent and hhmm == "09:00":
+        if d_key not in sent and hour_str == "09:00":
             await remind_dates_for_couple(bot, couple_id, tz)
             sent.add(d_key)
 
@@ -248,9 +235,9 @@ async def tick_minute(bot) -> None:
             if days is not None:
                 await check_love_status(bot, couple_id, days)
 
-        # --- Оценка фильма ---
+        # --- Оценка фильма (12:00) ---
         m_key = f"m:{couple_id}:{today}"
-        if m_key not in sent and hhmm == "12:00":
+        if m_key not in sent and hour_str == "12:00":
             await remind_rate_movie(bot, couple_id, tz)
             sent.add(m_key)
 
@@ -602,7 +589,7 @@ async def remind_no_gift(bot) -> None:
 
 
 # =========================================================
-#  ПИНОК ПО НЕЗАВЕРШЁННЫМ
+#  ПИНОК ПО НЕЗАВЕРШЁННЫМ (раз в 4 часа)
 # =========================================================
 
 async def remind_pending(bot) -> None:
