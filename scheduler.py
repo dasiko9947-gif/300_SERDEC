@@ -1,6 +1,7 @@
 import logging
 import random
 from datetime import datetime, timedelta
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -12,9 +13,38 @@ from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-# Планировщик тикает каждую минуту по UTC.
-# Внутри каждой пары считаем её локальное время.
 scheduler = AsyncIOScheduler(timezone="UTC")
+
+
+# =========================================================
+#  КЭШИ (для оптимизации запросов)
+# =========================================================
+
+# Кэш настроек пар: {couple_id: (settings_dict, timestamp)}
+_settings_cache: dict[int, tuple[dict, float]] = {}
+_SETTINGS_TTL = 300   # 5 минут
+
+# Кэш TZ: {couple_id: (ZoneInfo, timestamp)}
+_tz_cache: dict[int, tuple[ZoneInfo, float]] = {}
+_TZ_TTL = 3600   # 1 час
+
+
+def _cache_valid(ts: float, ttl: int) -> bool:
+    return (monotonic() - ts) < ttl
+
+
+def _cleanup_caches() -> None:
+    """Удаляет устаревшие записи из кэшей."""
+    now = monotonic()
+    _settings_cache_copy = dict(_settings_cache)
+    for cid, (_, ts) in _settings_cache_copy.items():
+        if (now - ts) > _SETTINGS_TTL:
+            _settings_cache.pop(cid, None)
+
+    _tz_cache_copy = dict(_tz_cache)
+    for cid, (_, ts) in _tz_cache_copy.items():
+        if (now - ts) > _TZ_TTL:
+            _tz_cache.pop(cid, None)
 
 
 # =========================================================
@@ -48,42 +78,43 @@ def setup_scheduler(bot) -> None:
 
 
 # =========================================================
-#  HELPERS
+#  БД (с кэшами)
 # =========================================================
 
 async def _get_notifications(couple_id: int) -> bool:
+    settings = await _get_settings(couple_id)
+    return bool(settings.get("notifications", 1))
+
+
+async def _get_active_couples() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT notifications FROM settings WHERE couple_id=?",
-            (couple_id,),
+            "SELECT id FROM couples WHERE status='active'"
         ) as cur:
-            row = await cur.fetchone()
-            if row is None:
-                return True
-            return bool(row["notifications"])
+            raw = await cur.fetchall()
+            return [dict(r) for r in raw]
 
 
 async def _get_couple_users(couple_id: int) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT telegram_id, name, tz FROM users WHERE couple_id=? ORDER BY id",
+            "SELECT telegram_id, name, tz FROM users "
+            "WHERE couple_id=? ORDER BY id",
             (couple_id,),
         ) as cur:
             raw = await cur.fetchall()
             return [dict(r) for r in raw]
 
 
-async def _get_active_couples() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT id FROM couples WHERE status='active'") as cur:
-            raw = await cur.fetchall()
-            return [dict(r) for r in raw]
-
-
 async def _get_settings(couple_id: int) -> dict:
+    """С кэшем на 5 минут."""
+    now = monotonic()
+    cached = _settings_cache.get(couple_id)
+    if cached and _cache_valid(cached[1], _SETTINGS_TTL):
+        return cached[0]
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -92,18 +123,29 @@ async def _get_settings(couple_id: int) -> dict:
             (couple_id,),
         ) as cur:
             row = await cur.fetchone()
-            if row is None:
-                return {
-                    "question_time": "10:00",
-                    "friday_time": "18:00",
-                    "friday_mode": 1,
-                    "notifications": 1,
-                    "tests_paused": 0,
-                }
-            return dict(row)
+
+    if row is None:
+        settings = {
+            "question_time": "10:00",
+            "friday_time": "18:00",
+            "friday_mode": 1,
+            "notifications": 1,
+            "tests_paused": 0,
+        }
+    else:
+        settings = dict(row)
+
+    _settings_cache[couple_id] = (settings, now)
+    return settings
 
 
 async def _get_couple_tz(couple_id: int) -> ZoneInfo:
+    """С кэшем на 1 час."""
+    now = monotonic()
+    cached = _tz_cache.get(couple_id)
+    if cached and _cache_valid(cached[1], _TZ_TTL):
+        return cached[0]
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -112,11 +154,15 @@ async def _get_couple_tz(couple_id: int) -> ZoneInfo:
             (couple_id,),
         ) as cur:
             row = await cur.fetchone()
+
     tz_str = row["tz"] if row and row["tz"] else "Europe/Moscow"
     try:
-        return ZoneInfo(tz_str)
+        tz = ZoneInfo(tz_str)
     except Exception:
-        return ZoneInfo("Europe/Moscow")
+        tz = ZoneInfo("Europe/Moscow")
+
+    _tz_cache[couple_id] = (tz, now)
+    return tz
 
 
 async def _safe_send(bot, chat_id: int, text: str, reply_markup=None) -> None:
@@ -133,21 +179,38 @@ async def _safe_send(bot, chat_id: int, text: str, reply_markup=None) -> None:
 # =========================================================
 
 async def tick_minute(bot) -> None:
+    # Кэш «уже отправлено» — по датам
     if not hasattr(tick_minute, "_sent"):
-        tick_minute._sent = set()  # type: ignore[attr-defined]
-    sent: set = tick_minute._sent  # type: ignore[attr-defined]
+        tick_minute._sent = {}   # type: ignore[attr-defined]
+    sent_by_date: dict[str, set] = tick_minute._sent  # type: ignore[attr-defined]
+
+    now_utc = datetime.utcnow()
+    today_utc = now_utc.strftime("%Y-%m-%d")
+
+    # Очистка старых дат (старше 2 дней)
+    cutoff = (now_utc - timedelta(days=2)).strftime("%Y-%m-%d")
+    for d in list(sent_by_date.keys()):
+        if d < cutoff:
+            del sent_by_date[d]
+
+    # Текущий набор для сегодня
+    sent: set = sent_by_date.setdefault(today_utc, set())
+
+    # Очистка кэшей раз в тик
+    _cleanup_caches()
 
     couples = await _get_active_couples()
     for c in couples:
         couple_id = c["id"]
+
+        # Из кэша — быстро
         tz = await _get_couple_tz(couple_id)
+        settings = await _get_settings(couple_id)
 
         now = datetime.now(tz)
         hhmm = now.strftime("%H:%M")
         today = now.strftime("%Y-%m-%d")
         weekday = now.weekday()
-
-        settings = await _get_settings(couple_id)
 
         # --- Вопрос дня ---
         q_key = f"q:{couple_id}:{today}"
@@ -173,27 +236,23 @@ async def tick_minute(bot) -> None:
                     await run_friday(bot, couple_id)
                     sent.add(f_key)
 
-        # --- Даты + статус «Вместе N дней» (в 09:00 TZ пары) ---
+        # --- Даты + статус ---
         d_key = f"d:{couple_id}:{today}"
         if d_key not in sent and hhmm == "09:00":
             await remind_dates_for_couple(bot, couple_id, tz)
             sent.add(d_key)
 
-            # Проверяем смену статуса «Вместе N дней»
             from utils.statuses import check_love_status
             from utils.helpers import days_together
             days = await days_together(couple_id)
             if days is not None:
                 await check_love_status(bot, couple_id, days)
 
-        # --- Оценить фильм (в 12:00 TZ пары) ---
+        # --- Оценка фильма ---
         m_key = f"m:{couple_id}:{today}"
         if m_key not in sent and hhmm == "12:00":
             await remind_rate_movie(bot, couple_id, tz)
             sent.add(m_key)
-
-    if len(sent) > 2000:
-        tick_minute._sent = set()  # type: ignore[attr-defined]
 
 
 # =========================================================
@@ -220,7 +279,6 @@ BOT_WISHES = [
 async def friday_morning_reminder(bot, couple_id: int) -> None:
     if not await _get_notifications(couple_id):
         return
-
     settings = await _get_settings(couple_id)
     if not settings.get("friday_mode", 1):
         return
@@ -252,7 +310,6 @@ async def friday_morning_reminder(bot, couple_id: int) -> None:
         )
 
     text = f"🖤 <b>Сегодня Пятница желаний!</b>\n\n{tail}"
-
     for u in users:
         await _safe_send(bot, u["telegram_id"], text)
 
@@ -260,7 +317,6 @@ async def friday_morning_reminder(bot, couple_id: int) -> None:
 async def run_friday(bot, couple_id: int) -> None:
     if not await _get_notifications(couple_id):
         return
-
     users = await _get_couple_users(couple_id)
     if len(users) < 2:
         return
@@ -331,13 +387,12 @@ async def run_friday(bot, couple_id: int) -> None:
 
 
 # =========================================================
-#  НАПОМИНАНИЯ О ДАТАХ
+#  ДАТЫ
 # =========================================================
 
 async def remind_dates_for_couple(bot, couple_id: int, tz: ZoneInfo) -> None:
     if not await _get_notifications(couple_id):
         return
-
     users = await _get_couple_users(couple_id)
     if len(users) < 2:
         return
@@ -367,8 +422,7 @@ async def remind_dates_for_couple(bot, couple_id: int, tz: ZoneInfo) -> None:
         if dd_mm == tomorrow_dm:
             for u in users:
                 await _safe_send(
-                    bot,
-                    u["telegram_id"],
+                    bot, u["telegram_id"],
                     f"📅 <b>Напоминание</b>\n\n"
                     f"Завтра — <b>{r['title']}</b>!\n\n"
                     f"Не забудь поздравить ❤️",
@@ -419,13 +473,12 @@ async def remind_dates_for_couple(bot, couple_id: int, tz: ZoneInfo) -> None:
 
 
 # =========================================================
-#  ОЦЕНИТЬ ФИЛЬМ (12:00 TZ пары)
+#  ОЦЕНКА ФИЛЬМА
 # =========================================================
 
 async def remind_rate_movie(bot, couple_id: int, tz: ZoneInfo) -> None:
     if not await _get_notifications(couple_id):
         return
-
     yesterday = (datetime.now(tz) - timedelta(days=1)).strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -441,7 +494,6 @@ async def remind_rate_movie(bot, couple_id: int, tz: ZoneInfo) -> None:
 
     if not movies:
         return
-
     users = await _get_couple_users(couple_id)
     if len(users) < 2:
         return
@@ -456,8 +508,7 @@ async def remind_rate_movie(bot, couple_id: int, tz: ZoneInfo) -> None:
             ])
             for u in users:
                 await _safe_send(
-                    bot,
-                    u["telegram_id"],
+                    bot, u["telegram_id"],
                     f"🎬 Как вам фильм?\n\n<b>«{m['title']}»</b>\n\n"
                     f"Оцени от 1 до 10.",
                     reply_markup=kb,
@@ -465,17 +516,15 @@ async def remind_rate_movie(bot, couple_id: int, tz: ZoneInfo) -> None:
 
 
 # =========================================================
-#  ПОДАРОК БЕЗ ПОВОДА (раз в месяц)
+#  ПОДАРОК БЕЗ ПОВОДА
 # =========================================================
 
 async def remind_no_gift(bot) -> None:
     couples = await _get_active_couples()
-
     for c in couples:
         couple_id = c["id"]
         if not await _get_notifications(couple_id):
             continue
-
         users = await _get_couple_users(couple_id)
         if len(users) < 2:
             continue
@@ -528,13 +577,11 @@ async def remind_no_gift(bot) -> None:
                 if u["telegram_id"] != user["telegram_id"]:
                     partner = u
                     break
-
             if partner is None:
                 continue
 
             await _safe_send(
-                bot,
-                user["telegram_id"],
+                bot, user["telegram_id"],
                 f"🎁 <b>Давно не дарил(а) подарок {partner['name']}!</b>\n\n"
                 f"Может, пора? Загляни в магазин — там 9 подарков 💞",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -555,17 +602,15 @@ async def remind_no_gift(bot) -> None:
 
 
 # =========================================================
-#  ПИНОК ПО НЕЗАВЕРШЁННЫМ (раз в час)
+#  ПИНОК ПО НЕЗАВЕРШЁННЫМ
 # =========================================================
 
 async def remind_pending(bot) -> None:
     couples = await _get_active_couples()
-
     for c in couples:
         couple_id = c["id"]
         if not await _get_notifications(couple_id):
             continue
-
         users = await _get_couple_users(couple_id)
         if len(users) < 2:
             continue
