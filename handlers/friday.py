@@ -15,6 +15,7 @@ from database import (
     spend_hearts,
     _fetchone,
     _fetchall,
+    _execute,
 )
 from keyboards import kb_friday, kb_back
 from config import CANCEL_WISH_COST, REPLACE_WISH_COST, DB_PATH
@@ -340,6 +341,7 @@ async def btn_friday(message: Message):
 
 @router.callback_query(F.data.startswith("friday:accept:"))
 async def friday_accept(call: CallbackQuery):
+    """Пользователь подтверждает участие в Пятнице (не выполнение)."""
     parts = cb_parts(call)
     if len(parts) < 3:
         await call.answer()
@@ -360,29 +362,195 @@ async def friday_accept(call: CallbackQuery):
         await call.answer("Пара не найдена", show_alert=True)
         return
 
-    # Помечаем событие done
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE friday_events SET status='done' WHERE id=?",
-            (event_id,),
-        )
-        await db.commit()
-
-    # Награда +30 обоим
-    await reward_friday_done(couple["user_a_id"], couple["user_b_id"])
-
-    text = "🖤 <b>Пятница выполнена!</b>\n\n+30 ❤️ каждому. Так держать ❤️"
-
-    # Ачивки
-    new_ach = await check_friday_milestones(
-        couple["id"], couple["user_a_id"], couple["user_b_id"]
+    # Получаем событие
+    event = await _fetchone(
+        "SELECT * FROM friday_events WHERE id=?", (event_id,)
     )
-    if new_ach:
-        text += "\n\n🏆 <b>Новые достижения:</b>\n\n" + "\n\n".join(new_ach)
+    if event is None:
+        await call.answer("Событие не найдено", show_alert=True)
+        return
 
-    await safe_edit(call, text)
+    if event["status"] != "active":
+        await call.answer("Уже обработано", show_alert=True)
+        return
+
+    # Определяем, кто это
+    is_a = call.from_user.id == couple["user_a_id"]
+    field = "user_a_accepted" if is_a else "user_b_accepted"
+
+    # Уже подтвердил?
+    if event[field]:
+        await call.answer("Ты уже подтвердил(а)", show_alert=True)
+        return
+
+    # Обновляем
+    await _execute(
+        f"UPDATE friday_events SET {field}=1 WHERE id=?",
+        (event_id,),
+    )
 
     partner = await get_partner(user["couple_id"], call.from_user.id)
+
+    # Пересматриваем событие
+    event2 = await _fetchone(
+        "SELECT * FROM friday_events WHERE id=?", (event_id,)
+    )
+    if event2 is None:
+        await call.answer("Ошибка: событие пропало", show_alert=True)
+        return
+
+    both_accepted = bool(event2["user_a_accepted"]) and bool(event2["user_b_accepted"])
+
+    if both_accepted:
+        # Оба приняли — ждём понедельника
+        text = (
+            "✅ <b>Принято!</b>\n\n"
+            "У вас есть время до конца воскресенья.\n"
+            "В понедельник я спрошу, выполнили или нет."
+        )
+        await safe_edit(call, text)
+        if partner is not None:
+            await send_to(call.bot, partner["telegram_id"], text)
+    else:
+        await safe_edit(
+            call,
+            "✅ Ты принял(а).\n\nЖдём партнёра ⏳",
+        )
+        if partner is not None:
+            await send_to(
+                call.bot,
+                partner["telegram_id"],
+                f"🖤 {user['name']} принял(а) Пятницу!\n\n"
+                f"Подтверди тоже, чтобы продолжить.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="✅ Принято",
+                        callback_data=f"friday:accept:{event_id}",
+                    )],
+                ]),
+            )
+    await call.answer()
+
+@router.callback_query(F.data.startswith("friday:done:"))
+async def friday_done(call: CallbackQuery):
+    """Один из партнёров подтвердил выполнение."""
+    parts = cb_parts(call)
+    try:
+        event_id = int(parts[2])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+
+    user = await get_user(call.from_user.id)
+    if user is None:
+        await call.answer()
+        return
+    couple = await get_couple(user["couple_id"])
+    if couple is None:
+        await call.answer()
+        return
+
+    event = await _fetchone(
+        "SELECT * FROM friday_events WHERE id=?", (event_id,)
+    )
+    if event is None:
+        await call.answer()
+        return
+
+    if event["status"] != "active":
+        await call.answer("Уже обработано", show_alert=True)
+        return
+
+    is_a = call.from_user.id == couple["user_a_id"]
+    field = "user_a_done" if is_a else "user_b_done"
+
+    await _execute(
+        f"UPDATE friday_events SET {field}=1 WHERE id=?",
+        (event_id,),
+    )
+
+    event = await _fetchone(
+        "SELECT * FROM friday_events WHERE id=?", (event_id,)
+    )
+    if event is None:
+        await call.answer()
+        return
+
+    partner = await get_partner(user["couple_id"], call.from_user.id)
+
+    both_done = bool(event["user_a_done"]) and bool(event["user_b_done"])
+
+    if both_done:
+        # Проверяем, что ещё не начисляли
+        if event["status"] != "done":
+            await _execute(
+                "UPDATE friday_events SET status='done' WHERE id=?",
+                (event_id,),
+            )
+            await reward_friday_done(couple["user_a_id"], couple["user_b_id"])
+
+            text = (
+                "🖤 <b>Пятница засчитана!</b>\n\n"
+                "+30 ❤️ каждому. Так держать ❤️"
+            )
+            await safe_edit(call, text)
+            if partner is not None:
+                await send_to(call.bot, partner["telegram_id"], text)
+        else:
+            await safe_edit(call, "✅ Уже засчитано")
+    else:
+        await safe_edit(call, "✅ Ждём партнёра ⏳")
+        if partner is not None:
+            await send_to(
+                call.bot,
+                partner["telegram_id"],
+                f"✅ {user['name']} подтвердил(а), что Пятница выполнена.\n\n"
+                f"Подтверди тоже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Да",
+                            callback_data=f"friday:done:{event_id}",
+                        ),
+                        InlineKeyboardButton(
+                            text="❌ Нет",
+                            callback_data=f"friday:not_done:{event_id}",
+                        ),
+                    ],
+                ]),
+            )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("friday:not_done:"))
+async def friday_not_done(call: CallbackQuery):
+    """Один из партнёров сказал, что не выполнено → Пятница не засчитана."""
+    parts = cb_parts(call)
+    try:
+        event_id = int(parts[2])
+    except (ValueError, IndexError):
+        await call.answer()
+        return
+
+    user = await get_user(call.from_user.id)
+    if user is None:
+        await call.answer()
+        return
+
+    await _execute(
+        "UPDATE friday_events SET status='failed' WHERE id=?",
+        (event_id,),
+    )
+    await safe_edit(
+        call,
+        "❌ Пятница не засчитана.\n\nВ следующий раз получится!",
+    )
+    partner = await get_partner(user["couple_id"], call.from_user.id)
     if partner is not None:
-        await send_to(call.bot, partner["telegram_id"], text)
+        await send_to(
+            call.bot,
+            partner["telegram_id"],
+            f"❌ {user['name']} отметил(а), что не выполнено.\n\n"
+            "Пятница не засчитана.",
+        )
     await call.answer()

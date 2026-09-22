@@ -812,7 +812,7 @@ async def pay_check(call: CallbackQuery):
         return
     yookassa_id = parts[1]
 
-    from database import _fetchone, _execute
+    from database import _fetchone, _execute, add_hearts, get_user
     p = await _fetchone(
         "SELECT * FROM payments_log WHERE yookassa_id=?", (yookassa_id,)
     )
@@ -830,7 +830,6 @@ async def pay_check(call: CallbackQuery):
 
     if status == "succeeded":
         # Начисляем
-        from database import add_hearts
         recipient_id = p["recipient_id"] or p["user_id"]
         hearts = p["hearts"]
 
@@ -848,13 +847,29 @@ async def pay_check(call: CallbackQuery):
             (p["id"],),
         )
 
-        # Уведомления
+        # ---- УВЕДОМЛЕНИЕ АДМИНУ ----
+        try:
+            from utils.admin_helpers import notify_admin
+            buyer = await get_user(p["user_id"])
+            buyer_name = buyer["name"] if buyer else "?"
+            await notify_admin(
+                call.bot,
+                f"💰 <b>Покупка сердечек!</b>\n\n"
+                f"👤 {buyer_name} — <code>{p['user_id']}</code>\n"
+                f"💎 Пакет: {p['package']} ❤️\n"
+                f"❤️ Начислено: {hearts}\n"
+                f"👤 Получатель: <code>{recipient_id}</code>",
+            )
+        except Exception:
+            pass
+
+        # Уведомления получателям
         if recipient_id != p["user_id"]:
             partner = await get_user(recipient_id)
             name = partner["name"] if partner else "партнёр"
             await send_to(
                 call.bot, recipient_id,
-                f"🎁 <b>Тебе подарок — {hearts} ❤️!</b>\n\nПоздравляю! ❤️",
+                f"🎁 <b>Тебе подарок — {hearts} ❤️!</b>\n\nПриятно, да? ❤️",
             )
             await safe_edit(
                 call,

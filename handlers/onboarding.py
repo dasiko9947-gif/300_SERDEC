@@ -51,7 +51,7 @@ CITIES: list[tuple[str, str]] = [
 
 START_A = (
     "Привет! 👋\n\n"
-    "Я бот для пар — 300 СЕРДЕЦ ❤️\n"
+    "Я бот для пар — 300 СЕРДЕЦ ❤️ .\n"
     "Помогу вам с фильмами, желаниями и сюрпризами.\n\n"
     "Давай познакомимся."
 )
@@ -215,7 +215,7 @@ async def start(message: Message, state: FSMContext):
     if user is not None and user["couple_id"]:
         couple = await get_couple(user["couple_id"])
         if couple is not None and couple["status"] == "active":
-            await message.answer("Ты уже в паре ❤️", reply_markup=kb_main_reply())
+            await message.answer("Ты уже в паре ❤️", reply_markup=kb_main_reply(user_id=message.from_user.id))
             return
         if couple is not None and couple["status"] == "pending":
             bot = message.bot
@@ -227,7 +227,7 @@ async def start(message: Message, state: FSMContext):
             await message.answer(
                 f"⏳ Ждём твою половинку.\n\n"
                 f"Отправь ей ссылку:\n{link}",
-                reply_markup=kb_main_reply(),
+                reply_markup=kb_main_reply(user_id=message.from_user.id),
             )
             return
 
@@ -285,13 +285,16 @@ async def onb_gender(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     couple_id = data.get("couple_id")
 
-    # ---- B ----
+    # =========================================================
+    #  ЭТО B — пришёл по ссылке
+    # =========================================================
     if couple_id is not None:
         await update_user(call.from_user.id, gender=gender)
 
-        # Копируем TZ от A (он её уже выбрал)
+        # Копируем TZ от A
         a_user = await _fetchone(
-            "SELECT * FROM users WHERE telegram_id=(SELECT user_a_id FROM couples WHERE id=?)",
+            "SELECT * FROM users WHERE telegram_id="
+            "(SELECT user_a_id FROM couples WHERE id=?)",
             (couple_id,),
         )
         if a_user is not None and a_user.get("tz"):
@@ -300,6 +303,23 @@ async def onb_gender(call: CallbackQuery, state: FSMContext):
         await join_couple(couple_id, call.from_user.id)
 
         a_name = a_user["name"] if a_user and a_user.get("name") else "партнёр"
+
+        # ---- УВЕДОМЛЕНИЕ АДМИНУ ----
+        from utils.admin_helpers import notify_admin
+        a_id = a_user["telegram_id"] if a_user else "?"
+        a_n = a_user["name"] if a_user and a_user.get("name") else "?"
+        b_id = call.from_user.id
+        b_n = call.from_user.full_name or "?"
+        try:
+            await notify_admin(
+                call.bot,
+                f"🎉 <b>Новая пара зарегистрирована!</b>\n\n"
+                f"👤 A: {a_n} — <code>{a_id}</code>\n"
+                f"👤 B: {b_n} — <code>{b_id}</code>\n"
+                f"🆔 Couple ID: <code>{couple_id}</code>",
+            )
+        except Exception:
+            pass
 
         await state.clear()
 
@@ -313,13 +333,12 @@ async def onb_gender(call: CallbackQuery, state: FSMContext):
             await bot.send_message(
                 call.from_user.id,
                 "Главное меню:",
-                reply_markup=kb_main_reply(),
+                reply_markup=kb_main_reply(user_id=call.from_user.id),
             )
-            # Приветствие с описанием — один раз
             await bot.send_message(call.from_user.id, WELCOME_TEXT)
 
-        # Уведомляем A (без повторного WELCOME_TEXT)
-        if a_user is not None:
+        # Уведомить A (без повторного WELCOME_TEXT)
+        if a_user is not None and a_user.get("telegram_id") is not None:
             await send_to(
                 call.bot,
                 a_user["telegram_id"],
@@ -330,11 +349,12 @@ async def onb_gender(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
-    # ---- A ----
+    # =========================================================
+    #  ЭТО A — обычный онбординг
+    # =========================================================
     await state.set_state(Onboarding.start_date)
     await safe_edit(call, Q_START_DATE, reply_markup=skip_btn())
     await call.answer()
-
 
 # =========================================================
 #  ШАГ 3: ДАТА НАЧАЛА ОТНОШЕНИЙ (A, можно пропустить)
@@ -411,9 +431,8 @@ async def onb_tz(call: CallbackQuery, state: FSMContext):
         await bot.send_message(
             call.from_user.id,
             "Как только партнёр подключится — я пришлю уведомление.",
-            reply_markup=kb_main_reply(),
+            reply_markup=kb_main_reply(user_id=call.from_user.id),
         )
-        # Приветствие с описанием — один раз
         await bot.send_message(call.from_user.id, WELCOME_TEXT)
 
     await call.answer()

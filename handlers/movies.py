@@ -19,6 +19,7 @@ from database import (
     get_movie,
     spend_hearts,
     _execute,
+    _fetchone,
 )
 from keyboards import kb_movies, kb_back, kb_confirm
 from keyboards import kb_main_reply
@@ -341,13 +342,16 @@ async def movie_today_confirm(call: CallbackQuery):
         return
     partner = await get_partner(user["couple_id"], call.from_user.id)
 
-    # Фиксируем watched_at
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE movies SET watched_at=datetime('now') WHERE id=?",
-            (movie_id,),
-        )
-        await db.commit()
+    # Сбрасываем watched_at у ВСЕХ фильмов пары
+    await _execute(
+        "UPDATE movies SET watched_at=NULL WHERE couple_id=?",
+        (user["couple_id"],),
+    )
+    # Фиксируем watched_at только у этого
+    await _execute(
+        "UPDATE movies SET watched_at=datetime('now') WHERE id=?",
+        (movie_id,),
+    )
 
     text = (
         f"✅ Отлично!\n\n"
@@ -523,12 +527,35 @@ async def movie_rate(call: CallbackQuery):
         await call.answer()
         return
 
+    # ---- Проверка: фильм — единственный активный ----
+    row = await _fetchone(
+        "SELECT COUNT(*) AS c FROM movies "
+        "WHERE couple_id=? AND watched_at IS NOT NULL",
+        (user["couple_id"],),
+    )
+    if row and row["c"] > 1:
+        await call.answer(
+            "Сейчас можно оценивать только один фильм.",
+            show_alert=True,
+        )
+        return
+
+    # Проверка: этот фильм — с watched_at
+    movie_check = await get_movie(movie_id)
+    if movie_check is None or movie_check.get("watched_at") is None:
+        await call.answer(
+            "Этот фильм не отмечен как отсмотренный.",
+            show_alert=True,
+        )
+        return
+
     # Определяем поле
     field = "rating_a" if call.from_user.id == couple["user_a_id"] else "rating_b"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"UPDATE movies SET {field}=? WHERE id=?", (rating, movie_id))
-        await db.commit()
+    await _execute(
+        f"UPDATE movies SET {field}=? WHERE id=?",
+        (rating, movie_id),
+    )
 
     movie = await get_movie(movie_id)
     if movie is None:
@@ -537,6 +564,7 @@ async def movie_rate(call: CallbackQuery):
 
     partner = await get_partner(user["couple_id"], call.from_user.id)
 
+    # Если партнёр ещё не поставил
     if movie.get("rating_a") is None or movie.get("rating_b") is None:
         await safe_edit(
             call,
@@ -560,13 +588,12 @@ async def movie_rate(call: CallbackQuery):
         couple["id"], couple["user_a_id"], couple["user_b_id"]
     )
     if new_ach:
-        text += "\n\n🏆 <b>Новые достижения:</b>\n" + "\n".join(new_ach)
+        text += "\n\n🏆 <b>Новые ачивки:</b>\n\n" + "\n\n".join(new_ach)
 
     await safe_edit(call, text)
     if partner is not None:
         await send_to(call.bot, partner["telegram_id"], text)
     await call.answer()
-
 
 # =========================================================
 #  📜 ИСТОРИЯ ПРОСМОТРОВ
@@ -726,7 +753,8 @@ async def movie_right_title(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ Отправлено {partner['name']}.\n\nЖдём ⏳",
-        reply_markup=kb_main_reply(),
+        reply_markup=kb_main_reply(user_id=message.from_user.id)
+        ,
     )
 
 

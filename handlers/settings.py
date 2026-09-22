@@ -693,19 +693,24 @@ async def set_delete_pair_confirm(call: CallbackQuery):
     couple_id = user["couple_id"]
     partner = await get_partner(couple_id, call.from_user.id)
 
+    # Собираем оба telegram_id
+    tg_ids = [call.from_user.id]
+    if partner is not None:
+        tg_ids.append(partner["telegram_id"])
+
     # Уведомим партнёра
     if partner is not None:
         await send_to(
             call.bot,
             partner["telegram_id"],
-            f"💔 Пара удалена.\n\n"
-            f"Все данные стёрты.\n"
-            f"Если захотите начать заново — /start.",
+            "💔 Пара удалена.\n\n"
+            "Все данные стёрты.\n"
+            "Если захотите начать заново — /start.",
         )
 
-    # Удаляем ВСЁ, где есть couple_id
     async with aiosqlite.connect(DB_PATH) as db:
-        for table in [
+        # 1. Удаляем всё, что по couple_id
+        tables_by_couple = [
             "gifts",
             "wishes",
             "friday_events",
@@ -717,53 +722,48 @@ async def set_delete_pair_confirm(call: CallbackQuery):
             "transactions",
             "transfers",
             "settings",
-            "referrals",
-        ]:
+            "question_answers",
+            "test_answers",
+            "test_progress",
+            "portraits",
+            "daily_answers",
+        ]
+        for table in tables_by_couple:
             try:
-                if table == "referrals":
-                    # referrals не имеет couple_id — чистим по telegram_id
-                    await db.execute(
-                        "DELETE FROM referrals WHERE user_id=? OR invited_id=?",
-                        (call.from_user.id, call.from_user.id),
-                    )
-                else:
-                    await db.execute(
-                        f"DELETE FROM {table} WHERE couple_id=?", (couple_id,)
-                    )
+                await db.execute(
+                    f"DELETE FROM {table} WHERE couple_id=?", (couple_id,)
+                )
             except Exception as e:
-                # Если таблицы нет — пропускаем
                 import logging
                 logging.warning(f"delete_pair: skip {table}: {e}")
 
-        # Очищаем пользователей от couple_id и обнуляем балансы
+        # 2. Purchases — по user_id обоих
+        for tg_id in tg_ids:
+            await db.execute("DELETE FROM purchases WHERE user_id=?", (tg_id,))
+
+        # 3. Referrals — по user_id / invited_id
+        for tg_id in tg_ids:
+            await db.execute(
+                "DELETE FROM referrals WHERE user_id=? OR invited_id=?",
+                (tg_id, tg_id),
+            )
+
+        # 4. Обнуляем пользователей
         await db.execute(
-            "UPDATE users SET couple_id=NULL, hearts_balance=0, total_earned=0 "
-            "WHERE couple_id=?",
+            "UPDATE users SET couple_id=NULL, hearts_balance=0, total_earned=0, "
+            "avatar_pref='auto' WHERE couple_id=?",
             (couple_id,),
         )
 
-        # Удаляем саму пару
+        # 5. Удаляем пару
         await db.execute("DELETE FROM couples WHERE id=?", (couple_id,))
-
-        # Чистим purchases / transfers (у purchases нет couple_id, только user_id)
-        await db.execute(
-            "DELETE FROM purchases WHERE user_id=?", (call.from_user.id,)
-        )
-        if partner is not None:
-            await db.execute(
-                "DELETE FROM purchases WHERE user_id=?", (partner["telegram_id"],)
-            )
-            await db.execute(
-                "DELETE FROM transfers WHERE from_user=? OR to_user=?",
-                (partner["telegram_id"], partner["telegram_id"]),
-            )
 
         await db.commit()
 
     await safe_edit(
         call,
         "💔 Пара удалена.\n\n"
+        "Все данные стёрты.\n"
         "Чтобы начать заново — /start.",
     )
     await call.answer()
-    

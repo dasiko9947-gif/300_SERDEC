@@ -6,7 +6,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-
+from config import ADMIN_ID
+from utils.admin_helpers import is_admin
 from keyboards import (
     kb_main_reply,
     kb_movies,
@@ -18,7 +19,7 @@ from keyboards import (
 from database import get_user, get_couple, get_partner, get_movies, _fetchone
 from utils.helpers import safe_edit, send_to
 router = Router()
-
+from aiogram.fsm.context import FSMContext
 # =========================================================
 #  REPLY-КНОПКИ (главное меню снизу)
 # =========================================================
@@ -559,3 +560,13 @@ async def help_referral(call: CallbackQuery):
         reply_markup=kb_back("help:main"),
     )
     await call.answer()
+
+@router.message(F.text == "🛠 Админка")
+async def btn_admin(message: Message, state: FSMContext):
+    if message.from_user is None:
+        return
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    from handlers.admin import ADMIN_MAIN_TEXT, _admin_main_kb
+    await message.answer(ADMIN_MAIN_TEXT, reply_markup=_admin_main_kb())
