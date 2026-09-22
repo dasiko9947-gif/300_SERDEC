@@ -1,4 +1,7 @@
+"""Хелперы: UI, callback data, дни вместе, объятия."""
+import logging
 from typing import Any
+from datetime import datetime
 
 from aiogram.types import (
     CallbackQuery,
@@ -10,8 +13,11 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ParseMode
 
-from datetime import datetime
 from database import _fetchall
+
+logger = logging.getLogger(__name__)
+
+
 # =========================================================
 #  UI
 # =========================================================
@@ -67,7 +73,6 @@ async def safe_edit_photo(call: CallbackQuery, photo_path: str, caption: str, re
             parse_mode=ParseMode.HTML,
         )
     except Exception:
-        # Если фото не отправилось — отправляем текстом
         await bot.send_message(
             chat_id=call.from_user.id,
             text=caption,
@@ -85,6 +90,34 @@ async def send_to(bot, chat_id: int | None, text: str, reply_markup=None) -> Non
         reply_markup=reply_markup,
         parse_mode=ParseMode.HTML,
     )
+
+
+async def safe_send_photo(
+    bot,
+    chat_id: int | None,
+    photo_path: str,
+    caption: str,
+    reply_markup=None,
+) -> None:
+    """Отправляет фото с подписью через bot. Безопасно к None."""
+    if bot is None or chat_id is None:
+        return
+    try:
+        photo = FSInputFile(photo_path)
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # =========================================================
@@ -137,44 +170,24 @@ def build_grid(buttons: list[tuple[str, str]], cols: int = 2) -> InlineKeyboardM
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def safe_send_photo(
-    bot,
-    chat_id: int | None,
-    photo_path: str,
-    caption: str,
-    reply_markup=None,
-) -> None:
-    """Отправляет фото с подписью через bot. Безопасно к None."""
-    if bot is None or chat_id is None:
-        return
-    try:
-        photo = FSInputFile(photo_path)
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=photo,
-            caption=caption,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        # Фоллбэк — текстом
-        await bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML,
-        )
-    
+
+# =========================================================
+#  ОБЪЯТИЯ
+# =========================================================
+
 HUG_VARIANTS = [
-    "🤗 {sender} крепко обнял(а) {receiver}!",
-    "🫂 {sender} сжимает {receiver} в объятиях!",
-    "💞 {sender} обнимает {receiver} — тепло и нежно!",
-    "🤗 Крепкие объятия от {sender} для {receiver}!",
+    "🤗 {sender} крепко обнимает тебя!",
+    "🫂 {sender} сжимает тебя в объятиях!",
+    "💞 {sender} обнимает тебя — тепло и нежно!",
+    "🤗 Крепкие объятия от {sender}!",
 ]
 
 
 def hug_text(sender: str, receiver: str, idx: int) -> str:
-    """Возвращает текст объятия по индексу."""
+    """
+    Текст объятия.
+    'receiver' оставлен для совместимости, но в тексте всегда 'тебя'.
+    """
     template = HUG_VARIANTS[idx % len(HUG_VARIANTS)]
     return template.format(sender=sender, receiver=receiver)
 
@@ -201,7 +214,6 @@ async def days_together(couple_id: int) -> int | None:
         try:
             dt = datetime.strptime(date_str, fmt)
             if fmt == "%d.%m":
-                # Без года — берём текущий
                 dt = dt.replace(year=datetime.now().year)
             return (datetime.now() - dt).days
         except ValueError:
