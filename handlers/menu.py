@@ -126,7 +126,7 @@ async def btn_shop(message: Message):
     await message.answer(text, reply_markup=kb_shop())
 
 
-@router.message(F.text == "👤 Ваш профиль")
+@router.message(F.text == "👤 Мой профиль")
 async def btn_profile(message: Message):
     from handlers.profile import render_profile_msg
     await render_profile_msg(message)
