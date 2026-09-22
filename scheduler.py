@@ -3,7 +3,7 @@ import random
 from datetime import datetime, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
-
+from database import _fetchone
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -171,21 +171,21 @@ async def _safe_send(bot, chat_id: int, text: str, reply_markup=None) -> None:
 # =========================================================
 
 async def tick_hourly(bot) -> None:
-    # Кэш отправленного — по датам
+    """Раз в час: проверяем все события по TZ каждой пары."""
     if not hasattr(tick_hourly, "_sent"):
-        tick_hourly._sent = {}   # type: ignore[attr-defined]
-    sent_by_date: dict[str, set] = tick_hourly._sent  # type: ignore[attr-defined]
+        tick_hourly._sent = {}
+    sent_by_date: dict[str, set] = tick_hourly._sent
 
     now_utc = datetime.utcnow()
     today_utc = now_utc.strftime("%Y-%m-%d")
 
+    # Очистка старше 2 дней
     cutoff = (now_utc - timedelta(days=2)).strftime("%Y-%m-%d")
     for d in list(sent_by_date.keys()):
         if d < cutoff:
             del sent_by_date[d]
 
     sent: set = sent_by_date.setdefault(today_utc, set())
-
     _cleanup_caches()
 
     couples = await _get_active_couples()
@@ -195,7 +195,7 @@ async def tick_hourly(bot) -> None:
         settings = await _get_settings(couple_id)
 
         now = datetime.now(tz)
-        hour_str = now.strftime("%H:00")   # "10:00", "11:00", ...
+        hour_str = now.strftime("%H:00")
         today = now.strftime("%Y-%m-%d")
         weekday = now.weekday()
 
@@ -235,11 +235,49 @@ async def tick_hourly(bot) -> None:
             if days is not None:
                 await check_love_status(bot, couple_id, days)
 
-        # --- Оценка фильма (12:00) ---
-        m_key = f"m:{couple_id}:{today}"
-        if m_key not in sent and hour_str == "12:00":
-            await remind_rate_movie(bot, couple_id, tz)
-            sent.add(m_key)
+        # --- Оценить фильм (12:00, для отсмотренных ВЧЕРА) ---
+        if hour_str == "12:00":
+            yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT id, title, rating_a, rating_b FROM movies "
+                    "WHERE couple_id=? AND watched_at IS NOT NULL "
+                    "AND DATE(watched_at)=?",
+                    (couple_id, yesterday),
+                ) as cur:
+                    raw = await cur.fetchall()
+                    movies = [dict(r) for r in raw]
+
+            users = await _get_couple_users(couple_id)
+            if len(users) >= 2:
+                for m in movies:
+                    if m["rating_a"] is not None and m["rating_b"] is not None:
+                        continue
+                    m_key = f"m:{couple_id}:{m['id']}:{today}"
+                    if m_key in sent:
+                        continue
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="⭐ Оценить фильм",
+                            callback_data=f"movie:rate_menu:{m['id']}",
+                        )],
+                    ])
+                    for u in users:
+                        await _safe_send(
+                            bot, u["telegram_id"],
+                            f"🎬 Как вам фильм?\n\n<b>«{m['title']}»</b>\n\n"
+                            f"Оцени от 1 до 10.",
+                            reply_markup=kb,
+                        )
+                    sent.add(m_key)
+
+        # --- Понедельник 10:00: спросить про Пятницу ---
+        if weekday == 0 and hour_str == "10:00":
+            mon_key = f"mon:{couple_id}:{today}"
+            if mon_key not in sent:
+                await ask_friday_done(bot, couple_id)
+                sent.add(mon_key)
 
 
 # =========================================================
@@ -591,17 +629,36 @@ async def remind_no_gift(bot) -> None:
 # =========================================================
 #  ПИНОК ПО НЕЗАВЕРШЁННЫМ (раз в 4 часа)
 # =========================================================
-
 async def remind_pending(bot) -> None:
+    """Раз в 4 часа: напоминаем про неоценённые фильмы. Только днём по TZ пары."""
+    if not hasattr(remind_pending, "_sent"):
+        remind_pending._sent = set()
+    sent: set = remind_pending._sent
+
+    today_utc = datetime.utcnow().strftime("%Y-%m-%d")
+    # Очистка старых
+    remind_pending._sent = {k for k in sent if today_utc in k}
+    sent = remind_pending._sent
+
     couples = await _get_active_couples()
     for c in couples:
         couple_id = c["id"]
         if not await _get_notifications(couple_id):
             continue
+
+        tz = await _get_couple_tz(couple_id)
+        now_local = datetime.now(tz)
+        hour_local = now_local.hour
+
+        # Только днём
+        if hour_local < 9 or hour_local >= 22:
+            continue
+
         users = await _get_couple_users(couple_id)
         if len(users) < 2:
             continue
 
+        # Фильмы с watched_at >= 2 дней назад, но <= 7
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -613,26 +670,74 @@ async def remind_pending(bot) -> None:
                 (couple_id,),
             ) as cur:
                 raw = await cur.fetchall()
-                movies: list[dict] = [dict(r) for r in raw]
+                movies = [dict(r) for r in raw]
 
         for m in movies:
+            key = f"{couple_id}:{m['id']}:{today_utc}"
+            if key in sent:
+                continue  # уже отправляли сегодня
+
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
                     text="⭐ Оценить фильм",
                     callback_data=f"movie:rate_menu:{m['id']}",
                 )],
             ])
+
+            # Кому не поставили — тому и шлём
             if m["rating_a"] is None:
                 await _safe_send(
                     bot, users[0]["telegram_id"],
-                    f"🎬 Ты забыл(а) оценить «{m['title']}».\n\n"
-                    f"Это займёт 5 секунд 😉",
+                    f"🎬 Не забудь оценить «{m['title']}».",
                     reply_markup=kb,
                 )
             if m["rating_b"] is None:
                 await _safe_send(
                     bot, users[1]["telegram_id"],
-                    f"🎬 Ты забыл(а) оценить «{m['title']}».\n\n"
-                    f"Это займёт 5 секунд 😉",
+                    f"🎬 Не забудь оценить «{m['title']}».",
                     reply_markup=kb,
                 )
+            sent.add(key)
+
+# =========================================================
+#  ПОНЕДЕЛЬНИК: СПРОСИТЬ ПРО ПЯТНИЦУ
+# =========================================================
+
+async def ask_friday_done(bot, couple_id: int) -> None:
+    """В понедельник 10:00 спрашивает обоих, выполнили ли Пятницу."""
+    if not await _get_notifications(couple_id):
+        return
+
+    event = await _fetchone(
+        "SELECT * FROM friday_events "
+        "WHERE couple_id=? AND status='active' "
+        "AND user_a_accepted=1 AND user_b_accepted=1 "
+        "ORDER BY id DESC LIMIT 1",
+        (couple_id,),
+    )
+    if event is None:
+        return
+
+    users = await _get_couple_users(couple_id)
+    if len(users) < 2:
+        return
+
+    text = (
+        "🖤 <b>Пятница выполнена?</b>\n\n"
+        f"Желание: <b>{event['wish_text']}</b>\n\n"
+        "Подтверди, что вы это сделали."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Да",
+                callback_data=f"friday:done:{event['id']}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Нет",
+                callback_data=f"friday:not_done:{event['id']}",
+            ),
+        ],
+    ])
+    for u in users:
+        await _safe_send(bot, u["telegram_id"], text, reply_markup=kb)

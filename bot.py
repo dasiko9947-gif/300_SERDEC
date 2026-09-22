@@ -10,7 +10,7 @@ from config import BOT_TOKEN
 from database import init_db
 from handlers import (
     onboarding, menu, movies, friday, shop, gifts, avatars,
-    hearts, rating, profile, question, settings,
+    hearts, rating, profile, question, admin, settings,
 )
 from scheduler import setup_scheduler
 
@@ -52,6 +52,7 @@ async def main():
     dp.include_router(gifts.router)
     dp.include_router(hearts.router)
     dp.include_router(profile.router)
+    dp.include_router(admin.router)
     dp.include_router(question.router)
     dp.include_router(settings.router)
 

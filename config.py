@@ -6,7 +6,7 @@ load_dotenv()
 BOT_TOKEN: str = os.getenv("BOT_TOKEN") or ""
 DB_PATH: str = os.getenv("DB_PATH", "bot.db")
 TZ: str = os.getenv("TZ", "Europe/Moscow")
-
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 # ---- Пути к ассетам ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")

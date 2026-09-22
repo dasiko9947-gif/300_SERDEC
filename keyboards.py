@@ -4,25 +4,33 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-
+from config import ADMIN_ID
 
 # =========================================================
 #  ГЛАВНОЕ МЕНЮ — Reply-клавиатура
 # =========================================================
 
-def kb_main_reply() -> ReplyKeyboardMarkup:
-    """Главное меню снизу экрана. Кнопки — 2×2."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="🎬 Фильмы"),
-                KeyboardButton(text="🖤 Пятница желаний"),
-            ],
-            [
-                KeyboardButton(text="💰 Магазин"),
-                KeyboardButton(text="👤 Ваш профиль"),
-            ],
+from config import ADMIN_ID
+
+
+def kb_main_reply(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [
+            KeyboardButton(text="🎬 Фильмы"),
+            KeyboardButton(text="🖤 Пятница желаний"),
         ],
+        [
+            KeyboardButton(text="💰 Магазин"),
+            KeyboardButton(text="👤 Мой профиль"),
+        ],
+    ]
+
+    # Скрытая админ-кнопка
+    if user_id is not None and user_id == ADMIN_ID:
+        rows.append([KeyboardButton(text="🛠 Админка")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Выбери раздел...",
