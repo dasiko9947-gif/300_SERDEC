@@ -1,0 +1,2 @@
+ALTER TABLE users ADD COLUMN bot_blocked INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN bot_blocked_at TIMESTAMP;
