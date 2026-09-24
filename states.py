@@ -14,6 +14,7 @@ class MovieFSM(StatesGroup):
     choose_for_today = State()
     right_title = State() 
     rate = State()
+    random_pick = State() 
 
 
 class WishFSM(StatesGroup):

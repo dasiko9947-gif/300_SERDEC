@@ -102,3 +102,14 @@ YOOKASSA_WEBHOOK_URL = os.getenv("YOOKASSA_WEBHOOK_URL", "")
 
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8000"))
+
+# ---- Фильмы ----
+MOVIE_RANDOM_LIMIT_FREE = 3   # лимит в день
+MOVIE_ARTICLE_URL = os.getenv(
+    "MOVIE_ARTICLE_URL",
+    "https://telegra.ph/xxx",   # ← заменить на свой лендинг
+)
+
+# ---- Лимиты фильмов ----
+MOVIE_RANDOM_LIMIT_FREE = 3       # бесплатный тариф
+MOVIE_RANDOM_LIMIT_PREMIUM = 10   # премиум (потом)

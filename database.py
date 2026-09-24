@@ -34,6 +34,7 @@ async def init_db() -> None:
     # 3. Seed
     from utils.tests import seed_tests, seed_questions
     await seed_tests()
+    await seed_movies_base()
     await seed_questions()
 
 
@@ -462,3 +463,97 @@ async def get_couple_rank(couple_id: int) -> int | None:
         (couple_id,),
     )
     return row["rank"] if row else None
+
+# =========================================================
+#  MOVIES BASE (случайный фильм)
+# =========================================================
+
+async def seed_movies_base() -> None:
+    """Заполняет movies_base из utils.movies_data при первом запуске."""
+    from utils.movies_data import MOVIES
+
+    existing = await _fetchall("SELECT id FROM movies_base LIMIT 1")
+    if existing:
+        return
+
+    for m in MOVIES:
+        await _execute(
+            "INSERT INTO movies_base "
+            "(title, year, genre, duration, description, rating) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                m.get("title"),
+                m.get("year"),
+                m.get("genre"),
+                m.get("duration"),
+                m.get("description"),
+                m.get("rating", 0),
+            ),
+        )
+    logger.info(f"movies_base seeded: {len(MOVIES)} фильмов")
+
+
+async def get_random_movie(exclude_titles: list[str] | None = None) -> dict | None:
+    """Случайный фильм из базы. Исключает те, что уже в списке пары."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if exclude_titles:
+            placeholders = ",".join("?" * len(exclude_titles))
+            query = (
+                f"SELECT * FROM movies_base "
+                f"WHERE title NOT IN ({placeholders}) "
+                f"ORDER BY RANDOM() LIMIT 1"
+            )
+            params = tuple(exclude_titles)
+        else:
+            query = "SELECT * FROM movies_base ORDER BY RANDOM() LIMIT 1"
+            params = ()
+        async with db.execute(query, params) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+# =========================================================
+#  MOVIE LIMITS (случайный фильм)
+# =========================================================
+
+async def get_movie_limit(user_id: int, date_str: str) -> int:
+    """Сколько раз юзер сегодня нажимал «Случайный фильм»."""
+    row = await _fetchone(
+        "SELECT count FROM movie_limits WHERE user_id=? AND date=?",
+        (user_id, date_str),
+    )
+    return row["count"] if row else 0
+
+
+async def inc_movie_limit(user_id: int, date_str: str) -> None:
+    """Увеличивает счётчик нажатий на 1."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO movie_limits (user_id, date, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET count=count+1",
+            (user_id, date_str),
+        )
+        await db.commit()
+
+
+async def get_user_movie_limit(user_id: int) -> int:
+    """
+    Возвращает максимальный лимит для юзера.
+    Free = 3, Premium = 10.
+    """
+    from config import MOVIE_RANDOM_LIMIT_FREE, MOVIE_RANDOM_LIMIT_PREMIUM
+    user = await get_user(user_id)
+    if user is None:
+        return MOVIE_RANDOM_LIMIT_FREE
+
+    is_premium = user.get("is_premium", 0)
+    # Проверка premium_until (если есть)
+    premium_until = user.get("premium_until")
+    if is_premium and premium_until:
+        # Можно проверить дату — если не истёк
+        pass  # пока пропускаем
+
+    if is_premium:
+        return MOVIE_RANDOM_LIMIT_PREMIUM
+    return MOVIE_RANDOM_LIMIT_FREE

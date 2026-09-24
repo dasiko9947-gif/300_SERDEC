@@ -47,6 +47,9 @@ def kb_back(to: str = "menu:main") -> InlineKeyboardMarkup:
     ])
 
 
+from config import MOVIE_ARTICLE_URL
+
+
 def kb_movies() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить фильм", callback_data="movie:add")],
@@ -57,6 +60,35 @@ def kb_movies() -> InlineKeyboardMarkup:
     ])
 
 
+def kb_movie_add() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Написать своё", callback_data="movie:add_manual")],
+        [InlineKeyboardButton(text="🎲 Случайный фильм", callback_data="movie:random")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:movies")],
+    ])
+
+
+def kb_random_movie(partner_name: str = "партнёру") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Ещё", callback_data="movie:random")],
+        [InlineKeyboardButton(
+            text=f"✅ Отправить {partner_name}",
+            callback_data="movie:random_send",
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="movie:add")],
+    ])
+
+
+def kb_movie_help() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🎬 Что посмотреть?",
+            url=MOVIE_ARTICLE_URL,
+        )],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:movies")],
+    ])
+
+
 def kb_friday(mode_on: bool = True) -> InlineKeyboardMarkup:
     mode_text = "⚙️ Режим: ВКЛ" if mode_on else "⚙️ Режим: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -64,7 +96,6 @@ def kb_friday(mode_on: bool = True) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📜 История", callback_data="friday:history")],
         [InlineKeyboardButton(text=mode_text, callback_data="friday:toggle")],
         [InlineKeyboardButton(text="❓ Что это?", callback_data="friday:help")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
     ])
 
 def kb_shop() -> InlineKeyboardMarkup:
