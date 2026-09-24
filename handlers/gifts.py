@@ -450,7 +450,7 @@ async def gift_hug(call: CallbackQuery):
     text = hug_text(me["name"], partner["name"], random.randint(0, 3))
 
     await send_to(call.bot, to_user_id, text)
-    await call.answer("Обнял(а) ❤️")
+    await call.answer("Обнимаешь ❤️")
 
 
 # =========================================================

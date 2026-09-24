@@ -544,7 +544,7 @@ async def help_rating(call: CallbackQuery):
         "• Пятницы\n"
         "• Достижения\n"
         "• Покупки сердечек\n\n"
-        "Открыть рейтинг: <b>/rating</b>n",
+        "Открыть рейтинг: <b>/rating</b>",
         reply_markup=kb_back("help:main"),
     )
     await call.answer()

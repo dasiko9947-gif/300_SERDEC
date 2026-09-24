@@ -36,14 +36,14 @@ router = Router()
 # =========================================================
 
 async def send_daily_question(bot, couple_id: int) -> None:
-    """Отправляет вопрос дня обоим."""
+    """Отправляет вопрос дня обоим — но только тем, кто ещё не ответил."""
     users = await _get_couple_users(couple_id)
     if len(users) < 2:
         return
 
     test = await _get_current_test(couple_id)
     if test is None:
-        return  # все тесты пройдены
+        return
 
     progress = await _fetchone(
         "SELECT current_q FROM test_progress WHERE couple_id=? AND test_id=?",
@@ -60,6 +60,8 @@ async def send_daily_question(bot, couple_id: int) -> None:
     )
     if question is None:
         return
+
+    q_id = question["id"]
 
     text = (
         f"❓ <b>Вопрос дня</b>\n\n"
@@ -78,8 +80,17 @@ async def send_daily_question(bot, couple_id: int) -> None:
     kb = _question_kb(question)
 
     for u in users:
-        await send_to(bot, u["telegram_id"], text, reply_markup=kb)
+        tg_id = u["telegram_id"]
+        # Проверяем: уже ответил?
+        already = await _fetchone(
+            "SELECT id FROM daily_answers "
+            "WHERE couple_id=? AND question_id=? AND user_id=?",
+            (couple_id, q_id, tg_id),
+        )
+        if already:
+            continue   # ← уже ответил, не отправляем
 
+        await send_to(bot, tg_id, text, reply_markup=kb)
 
 async def _get_couple_users(couple_id: int) -> list[dict]:
     return await _fetchall(
@@ -151,7 +162,6 @@ def _question_kb(question: dict) -> InlineKeyboardMarkup:
 # =========================================================
 #  ОБРАБОТКА ОТВЕТА
 # =========================================================
-
 @router.callback_query(F.data.startswith("tq:"))
 async def test_answer(call: CallbackQuery):
     parts = cb_parts(call)
@@ -190,12 +200,17 @@ async def test_answer(call: CallbackQuery):
 
     q_type = question["q_type"] or "choice"
 
-    # Сохраняем ответ
-    await _execute(
-        "DELETE FROM daily_answers "
+    # ---- Проверка: уже отвечал на этот вопрос? ----
+    existing = await _fetchone(
+        "SELECT id, answer FROM daily_answers "
         "WHERE couple_id=? AND question_id=? AND user_id=?",
         (user["couple_id"], q_id, call.from_user.id),
     )
+    if existing:
+        await call.answer("Вы уже ответили на этот вопрос", show_alert=True)
+        return
+
+    # ---- Сохраняем ответ ----
     await _execute(
         "INSERT INTO daily_answers "
         "(couple_id, question_id, user_id, answer) "
@@ -269,42 +284,33 @@ async def test_answer(call: CallbackQuery):
 
     await call.answer()
 
-
-def _result_text(q_type, a, b, matched, reward, name_a, name_b) -> str:
+def _result_text(
+    q_type: str,
+    a: str,
+    b: str,
+    matched: bool,
+    reward: int,
+    name_a: str,
+    name_b: str,
+) -> str:
+    """Короткий текст результата — без 'a' / 'b'."""
     if q_type in ("scale5", "scale7"):
         try:
             diff = abs(int(a) - int(b))
         except ValueError:
             diff = 0
         if diff == 0:
-            tail = "Идеально! 🎯"
+            return f"🎯 <b>Идеально!</b>\n\n+{reward} ❤️ каждому."
         elif diff == 1:
-            tail = "Близко! ❤️"
+            return f"❤️ <b>Близко!</b>\n\n+{reward} ❤️ каждому."
         elif diff <= 2:
-            tail = "Средне. 🙂"
+            return f"🙂 <b>Средне.</b>\n\n+{reward} ❤️ каждому."
         else:
-            tail = "Далеко друг от друга. 🤔"
-        return (
-            f"📊 <b>Ваши ответы:</b>\n\n"
-            f"{name_a}: {a}\n"
-            f"{name_b}: {b}\n\n"
-            f"Разница: {diff}\n"
-            f"{tail}\n\n"
-            f"+{reward} ❤️ каждому."
-        )
+            return f"🤔 <b>Далеко друг от друга.</b>\n\n+{reward} ❤️ каждому."
+
     if matched:
-        return (
-            f"🎉 <b>Совпало!</b>\n\n"
-            f"{name_a}: {a}\n"
-            f"{name_b}: {b}\n\n"
-            f"+{reward} ❤️ каждому."
-        )
-    return (
-        f"❌ <b>Не совпало.</b>\n\n"
-        f"{name_a}: {a}\n"
-        f"{name_b}: {b}\n\n"
-        f"+{reward} ❤️ каждому за участие."
-    )
+        return f"🎉 <b>Ваши ответы совпали!</b>\n\n+{reward} ❤️ каждому."
+    return f"❌ <b>Ваши ответы разошлись.</b>\n\n+{reward} ❤️ каждому за участие."
 
 
 # =========================================================

@@ -20,10 +20,29 @@ from database import (
     spend_hearts,
     _execute,
     _fetchone,
+    _fetchall,
+    get_random_movie,
+    get_movie_limit,
+    inc_movie_limit,
+    get_user_movie_limit,
 )
-from keyboards import kb_movies, kb_back, kb_confirm
-from keyboards import kb_main_reply
-from database import spend_hearts, add_hearts
+
+from config import (
+    DB_PATH,
+    MOVIE_CHOICE_COST,
+    HEARTS_MOVIE_RATED,
+    MOVIE_RANDOM_LIMIT_FREE,
+)
+from keyboards import (
+    kb_movies,
+    kb_back,
+    kb_confirm,
+    kb_movie_add,
+    kb_random_movie,
+    kb_movie_help,
+    kb_main_reply,
+)
+
 from config import DB_PATH, MOVIE_CHOICE_COST, HEARTS_MOVIE_RATED
 from texts import (
     MOVIE_ADD_PROMPT,
@@ -85,11 +104,125 @@ async def open_movies(call: CallbackQuery):
 # =========================================================
 
 @router.callback_query(F.data == "movie:add")
-async def movie_add(call: CallbackQuery, state: FSMContext):
+async def movie_add(call: CallbackQuery):
+    await safe_edit(
+        call,
+        "➕ <b>Добавить фильм</b>\n\n"
+        "Выбери способ:",
+        reply_markup=kb_movie_add(),
+    )
+    await call.answer()
+
+@router.callback_query(F.data == "movie:add_manual")
+async def movie_add_manual(call: CallbackQuery, state: FSMContext):
     await state.set_state(MovieFSM.add_title)
     await safe_edit(call, MOVIE_ADD_PROMPT)
     await call.answer()
 
+@router.callback_query(F.data == "movie:random")
+async def movie_random(call: CallbackQuery, state: FSMContext):
+    user = await get_user(call.from_user.id)
+    if user is None:
+        await call.answer("Сначала /start", show_alert=True)
+        return
+
+    # ---- Проверка лимита ----
+    from datetime import date
+    today = date.today().isoformat()
+
+    limit_used = await get_movie_limit(call.from_user.id, today)
+    limit_max = await get_user_movie_limit(call.from_user.id)
+
+    if limit_used >= limit_max:
+        await safe_edit(
+            call,
+            f"🎲 <b>Лимит на сегодня</b>\n\n"
+            f"Ты использовал {limit_max} из {limit_max} нажатий.\n\n"
+            f"Возвращайся завтра ❤️",
+            reply_markup=kb_back("movie:add"),
+        )
+        await call.answer()
+        return
+
+    # ---- Увеличиваем счётчик при нажатии ----
+    await inc_movie_limit(call.from_user.id, today)
+
+    # ---- Исключаем фильмы, которые уже в списке пары ----
+    existing = await get_movies(user["couple_id"])
+    exclude_titles = [m["title"] for m in existing]
+
+    movie = await get_random_movie(exclude_titles)
+    if movie is None:
+        await call.answer("Не могу подобрать фильм 😔", show_alert=True)
+        return
+
+    # Сохраняем выбранный фильм в FSM
+    await state.update_data(
+        random_movie_id=movie["id"],
+        random_movie_title=movie["title"],
+    )
+
+    partner = await get_partner(user["couple_id"], call.from_user.id)
+    partner_name = partner["name"] if partner else "партнёру"
+
+    # Осталось попыток
+    left = limit_max - (limit_used + 1)
+
+    text = (
+        f"🎲 <b>Случайный фильм</b>\n\n"
+        f"🎬 <b>«{movie['title']}»</b> ({movie.get('year', '?')})\n\n"
+        f"{movie.get('genre', '')}. {movie.get('duration', '?')} мин.\n"
+        f"{movie.get('description', '')}\n\n"
+        f"<i>Осталось попыток сегодня: {left}</i>"
+    )
+
+    await safe_edit(call, text, reply_markup=kb_random_movie(partner_name))
+    await call.answer()
+
+@router.callback_query(F.data == "movie:random_send")
+async def movie_random_send(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+
+    movie_id = data.get("random_movie_id")
+    movie_title = data.get("random_movie_title")
+    if not movie_id or not movie_title:
+        await call.answer("Фильм потерян. Попробуй снова.", show_alert=True)
+        return
+
+    user = await get_user(call.from_user.id)
+    if user is None:
+        await call.answer()
+        return
+
+    # ---- Добавляем фильм в общий список пары (pending) ----
+    new_movie_id = await add_movie(
+        user["couple_id"], movie_title, call.from_user.id
+    )
+
+    # Счётчик УЖЕ увеличен в movie_random при нажатии
+
+    # ---- Отправляем партнёру на подтверждение ----
+    partner = await get_partner(user["couple_id"], call.from_user.id)
+    if partner is not None:
+        await send_to(
+            call.bot,
+            partner["telegram_id"],
+            MOVIE_CONFIRM_REQUEST.format(
+                partner_name=user["name"],
+                title=movie_title,
+            ),
+            reply_markup=kb_confirm(f"movie:confirm:{new_movie_id}"),
+        )
+
+    partner_name = partner["name"] if partner else "партнёру"
+    await safe_edit(
+        call,
+        f"✅ Отправлено {partner_name} на подтверждение.\n\n"
+        f"Ждём ответа ⏳",
+        reply_markup=kb_back("menu:movies"),
+    )
+    await call.answer()
 
 @router.message(MovieFSM.add_title)
 async def movie_add_title(message: Message, state: FSMContext):
@@ -126,12 +259,17 @@ async def movie_confirm(call: CallbackQuery):
     if len(parts) < 4:
         await call.answer()
         return
+
     try:
         movie_id = int(parts[2])
     except ValueError:
         await call.answer()
         return
-    decision = parts[3]
+
+    decision = parts[3]  # "yes" | "no"
+    if decision not in ("yes", "no"):
+        await call.answer()
+        return
 
     movie = await get_movie(movie_id)
     if movie is None:
@@ -142,31 +280,33 @@ async def movie_confirm(call: CallbackQuery):
     if user is None:
         await call.answer()
         return
-
-    couple = await get_couple(user["couple_id"])
-    if couple is None:
-        await call.answer("Пара не найдена", show_alert=True)
-        return
-
     partner = await get_partner(user["couple_id"], call.from_user.id)
 
     if decision == "yes":
+        # ---- Подтверждаем ----
         await confirm_movie(movie_id)
-        await safe_edit(call, MOVIE_CONFIRMED.format(title=movie["title"]))
+        await safe_edit(
+            call,
+            f"✅ Согласовано!\n\n🎬 «{movie['title']}» добавлен в список.",
+        )
         if partner is not None:
             await send_to(
                 call.bot,
                 partner["telegram_id"],
-                MOVIE_CONFIRMED.format(title=movie["title"]),
+                f"✅ Согласовано!\n\n🎬 «{movie['title']}» добавлен в список.",
             )
     else:
+        # ---- Удаляем ----
         await delete_movie(movie_id)
-        await safe_edit(call, MOVIE_REJECTED.format(title=movie["title"]))
+        await safe_edit(
+            call,
+            f"❌ Фильм отклонён.\n\n🎬 «{movie['title']}» не добавлен.",
+        )
         if partner is not None:
             await send_to(
                 call.bot,
                 partner["telegram_id"],
-                MOVIE_REJECTED.format(title=movie["title"]),
+                f"❌ Фильм отклонён.\n\n🎬 «{movie['title']}» не добавлен.",
             )
     await call.answer()
 
@@ -182,7 +322,14 @@ async def movie_list(call: CallbackQuery):
         await call.answer("Сначала /start", show_alert=True)
         return
 
-    movies = await get_movies(user["couple_id"])
+    # Только фильмы, которые ещё не смотрели
+    movies = await _fetchall(
+        "SELECT * FROM movies "
+        "WHERE couple_id=? AND status='in_list' "
+        "AND watched_at IS NULL "
+        "ORDER BY id DESC",
+        (user["couple_id"],),
+    )
     if not movies:
         await safe_edit(
             call,
@@ -194,14 +341,13 @@ async def movie_list(call: CallbackQuery):
 
     buttons: list[list[InlineKeyboardButton]] = []
     for m in movies[:30]:
-        # Указываем средний балл, если есть
         if m.get("rating_a") and m.get("rating_b"):
             avg = (m["rating_a"] + m["rating_b"]) / 2
             label = f"🎬 {m['title']} — {avg:.1f} ⭐"
         else:
             label = f"🎬 {m['title']}"
         buttons.append([InlineKeyboardButton(
-            text=label[:60],   # ограничиваем длину
+            text=label[:60],
             callback_data=f"movie:card:{m['id']}",
         )])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:movies")])
@@ -342,12 +488,34 @@ async def movie_today_confirm(call: CallbackQuery):
         return
     partner = await get_partner(user["couple_id"], call.from_user.id)
 
-    # Сбрасываем watched_at у ВСЕХ фильмов пары
+    # ---- Проверка: уже есть фильм на сегодня? ----
+    today_movie = await _fetchone(
+        "SELECT id, title FROM movies "
+        "WHERE couple_id=? AND watched_at IS NOT NULL "
+        "AND DATE(watched_at) = DATE('now')",
+        (user["couple_id"],),
+    )
+    if today_movie is not None and today_movie["id"] != movie_id:
+        await call.answer(
+            f"На сегодня уже выбран фильм «{today_movie['title']}».",
+            show_alert=True,
+        )
+        return
+
+    # ---- Проверка: фильм уже оценён? ----
+    if movie.get("rating_a") is not None and movie.get("rating_b") is not None:
+        await call.answer(
+            "Этот фильм уже просмотрен и оценён.",
+            show_alert=True,
+        )
+        return
+
+    # ---- Сбрасываем watched_at у ВСЕХ фильмов пары ----
     await _execute(
         "UPDATE movies SET watched_at=NULL WHERE couple_id=?",
         (user["couple_id"],),
     )
-    # Фиксируем watched_at только у этого
+    # Ставим watched_at только у этого
     await _execute(
         "UPDATE movies SET watched_at=datetime('now') WHERE id=?",
         (movie_id,),
@@ -848,5 +1016,9 @@ async def movie_right_no(call: CallbackQuery):
 
 @router.callback_query(F.data == "movie:help")
 async def movie_help(call: CallbackQuery):
-    await safe_edit(call, MOVIE_HELP, reply_markup=kb_back("menu:movies"))
+    await safe_edit(
+        call,
+        MOVIE_HELP,
+        reply_markup=kb_movie_help(),
+    )
     await call.answer()
