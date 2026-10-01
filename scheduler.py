@@ -3,7 +3,8 @@ import random
 from datetime import datetime, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
-from database import _fetchone
+from database import _fetchone 
+from database import _execute
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -235,15 +236,15 @@ async def tick_hourly(bot) -> None:
             if days is not None:
                 await check_love_status(bot, couple_id, days)
 
-                # --- Оценить фильм: 12:00, 13:00, 14:00 (по TZ пары) ---
-        # Отправляется для фильмов, отсмотренных ВЧЕРА (по UTC)
+                  # --- Оценить фильм: 12:00–14:00, для отсмотренных ВЧЕРА ---
         if hour_str in ("12:00", "13:00", "14:00"):
             yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
 
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(
-                    "SELECT id, title, rating_a, rating_b FROM movies "
+                    "SELECT id, title, rating_a, rating_b, reminder_sent_at "
+                    "FROM movies "
                     "WHERE couple_id=? AND watched_at IS NOT NULL "
                     "AND DATE(watched_at)=?",
                     (couple_id, yesterday),
@@ -254,12 +255,12 @@ async def tick_hourly(bot) -> None:
             users = await _get_couple_users(couple_id)
             if len(users) >= 2:
                 for m in movies:
-                    # Если уже оба оценили — не отправляем
+                    # Уже оба оценили — пропускаем
                     if m["rating_a"] is not None and m["rating_b"] is not None:
                         continue
 
-                    m_key = f"m:{couple_id}:{m['id']}:{today}"
-                    if m_key in sent:
+                    # Уже отправляли — пропускаем (флаг в БД!)
+                    if m.get("reminder_sent_at") is not None:
                         continue
 
                     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -275,7 +276,13 @@ async def tick_hourly(bot) -> None:
                             f"Оцени от 1 до 10.",
                             reply_markup=kb,
                         )
-                    sent.add(m_key)
+
+                    # Ставим флаг в БД
+                    await _execute(
+                        "UPDATE movies SET reminder_sent_at=datetime('now') "
+                        "WHERE id=?",
+                        (m["id"],),
+                    )
 
         # --- Понедельник 10:00: спросить про Пятницу ---
         if weekday == 0 and hour_str == "10:00":
@@ -283,6 +290,18 @@ async def tick_hourly(bot) -> None:
             if mon_key not in sent:
                 await ask_friday_done(bot, couple_id)
                 sent.add(mon_key)
+
+        # --- Понедельник 12:00: закрыть старые Пятницы (>6 дней) ---
+        if weekday == 0 and hour_str == "12:00":
+            old_key = f"old_fr:{couple_id}:{today}"
+            if old_key not in sent:
+                await _execute(
+                    "UPDATE friday_events SET status='failed' "
+                    "WHERE couple_id=? AND status='active' "
+                    "AND created_at <= datetime('now', '-6 days')",
+                    (couple_id,),
+                )
+                sent.add(old_key)
 
 
 # =========================================================
@@ -535,16 +554,27 @@ async def friday_morning_reminder(bot, couple_id: int) -> None:
 
 
 async def run_friday(bot, couple_id: int) -> None:
+    """Пятница: вытягивает желание и отправляет обоим."""
     if not await _get_notifications(couple_id):
         return
+
     users = await _get_couple_users(couple_id)
     if len(users) < 2:
         return
 
+    # ---- Закрыть все предыдущие активные Пятницы ----
+    await _execute(
+        "UPDATE friday_events SET status='failed' "
+        "WHERE couple_id=? AND status='active'",
+        (couple_id,),
+    )
+
+    # ---- Тянем желание из кувшина ----
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, text FROM wishes WHERE couple_id=? AND status='active' "
+            "SELECT id, text FROM wishes "
+            "WHERE couple_id=? AND status='active' "
             "ORDER BY RANDOM() LIMIT 1",
             (couple_id,),
         ) as cur:
@@ -556,25 +586,26 @@ async def run_friday(bot, couple_id: int) -> None:
         wish_id = wish["id"]
         wish_text = wish["text"]
     else:
+        # Кувшин пуст — желание от бота
         is_bot = True
         wish_text = random.choice(BOT_WISHES)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "INSERT INTO friday_events "
-            "(couple_id, wish_id, wish_text, is_bot_wish, status) "
-            "VALUES (?, ?, ?, ?, 'active')",
-            (couple_id, wish_id, wish_text, 1 if is_bot else 0),
+    # ---- Создаём новое событие ----
+    event_id = await _execute(
+        "INSERT INTO friday_events "
+        "(couple_id, wish_id, wish_text, is_bot_wish, status) "
+        "VALUES (?, ?, ?, ?, 'active')",
+        (couple_id, wish_id, wish_text, 1 if is_bot else 0),
+    )
+
+    # Помечаем желание как использованное
+    if wish_id is not None:
+        await _execute(
+            "UPDATE wishes SET status='used' WHERE id=?",
+            (wish_id,),
         )
-        await db.commit()
-        event_id = cur.lastrowid
 
-        if wish_id is not None:
-            await db.execute(
-                "UPDATE wishes SET status='used' WHERE id=?", (wish_id,)
-            )
-            await db.commit()
-
+    # ---- Кнопки ----
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="✅ Принято",
@@ -582,7 +613,7 @@ async def run_friday(bot, couple_id: int) -> None:
         )],
         [
             InlineKeyboardButton(
-                text="⏭ Отмена — 300 ❤️",
+                text="⏭ Сжечь задание — 300 ❤️",
                 callback_data=f"friday:cancel:{event_id}",
             ),
             InlineKeyboardButton(
@@ -604,7 +635,6 @@ async def run_friday(bot, couple_id: int) -> None:
 
     for u in users:
         await _safe_send(bot, u["telegram_id"], header, reply_markup=kb)
-
 
 # =========================================================
 #  ДАТЫ
@@ -899,10 +929,11 @@ async def remind_pending(bot) -> None:
 # =========================================================
 
 async def ask_friday_done(bot, couple_id: int) -> None:
-    """В понедельник 10:00 спрашивает обоих, выполнили ли Пятницу."""
+    """В понедельник 10:00: спросить обоих, выполнили ли Пятницу."""
     if not await _get_notifications(couple_id):
         return
 
+    # Ищем активную Пятницу, которую оба приняли
     event = await _fetchone(
         "SELECT * FROM friday_events "
         "WHERE couple_id=? AND status='active' "

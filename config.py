@@ -65,9 +65,9 @@ def get_love_status(days: int) -> str:
 
 # ---- Пакеты сердечек ----
 PACKAGES = [
-    {"hearts": 300,  "price": 1, "bonus_percent": 10},
-    {"hearts": 1000, "price": 2, "bonus_percent": 20},
-    {"hearts": 3000, "price": 3, "bonus_percent": 30},
+    {"hearts": 300,  "price": 99, "bonus_percent": 10},
+    {"hearts": 1000, "price": 249, "bonus_percent": 20},
+    {"hearts": 3000, "price": 499, "bonus_percent": 30},
 ]
 
 FIRST_PURCHASE_BONUS = 30   # +30% на первую покупку
