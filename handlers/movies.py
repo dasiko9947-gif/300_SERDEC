@@ -468,12 +468,17 @@ async def movie_today_pick(call: CallbackQuery):
 @router.callback_query(F.data.startswith("movie:today_confirm:"))
 async def movie_today_confirm(call: CallbackQuery):
     parts = cb_parts(call)
-    if len(parts) < 3:
+    if len(parts) < 4:
         await call.answer()
         return
     try:
         movie_id = int(parts[2])
     except ValueError:
+        await call.answer()
+        return
+    decision = parts[3]  # "yes" | "no"
+
+    if decision not in ("yes", "no"):
         await call.answer()
         return
 
@@ -488,7 +493,30 @@ async def movie_today_confirm(call: CallbackQuery):
         return
     partner = await get_partner(user["couple_id"], call.from_user.id)
 
-    # ---- Проверка: уже есть фильм на сегодня? ----
+    # =========================================================
+    #  ОТКАЗ
+    # =========================================================
+    if decision == "no":
+        await safe_edit(
+            call,
+            f"❌ <b>Отказано.</b>\n\n"
+            f"🎬 «{movie['title']}» не будем смотреть сегодня.",
+        )
+        if partner is not None:
+            await send_to(
+                call.bot,
+                partner["telegram_id"],
+                f"❌ <b>{user['name']} отказался(ась).</b>\n\n"
+                f"🎬 «{movie['title']}» не будем смотреть сегодня.\n\n"
+                f"Выбери другой фильм.",
+            )
+        await call.answer()
+        return
+
+    # =========================================================
+    #  СОГЛАСИЕ
+    # =========================================================
+    # Проверка: уже смотрели другой фильм сегодня?
     today_movie = await _fetchone(
         "SELECT id, title FROM movies "
         "WHERE couple_id=? AND watched_at IS NOT NULL "
@@ -502,7 +530,7 @@ async def movie_today_confirm(call: CallbackQuery):
         )
         return
 
-    # ---- Проверка: фильм уже оценён? ----
+    # Проверка: фильм уже оценён?
     if movie.get("rating_a") is not None and movie.get("rating_b") is not None:
         await call.answer(
             "Этот фильм уже просмотрен и оценён.",
@@ -510,19 +538,20 @@ async def movie_today_confirm(call: CallbackQuery):
         )
         return
 
-    # ---- Сбрасываем watched_at у ВСЕХ фильмов пары ----
+    # Сбрасываем watched_at у всех фильмов пары
     await _execute(
-        "UPDATE movies SET watched_at=NULL WHERE couple_id=?",
+        "UPDATE movies SET watched_at=NULL, reminder_sent_at=NULL "
+        "WHERE couple_id=?",
         (user["couple_id"],),
     )
-    # Ставим watched_at только у этого
+    # Ставим только у этого
     await _execute(
         "UPDATE movies SET watched_at=datetime('now') WHERE id=?",
         (movie_id,),
     )
 
     text = (
-        f"✅ Отлично!\n\n"
+        f"✅ <b>Отлично!</b>\n\n"
         f"Сегодня смотрите:\n🎬 «{movie['title']}»\n\n"
         f"Приятного просмотра ❤️\n\n"
         f"Завтра в 12:00 я спрошу, как вам."
@@ -532,10 +561,10 @@ async def movie_today_confirm(call: CallbackQuery):
         await send_to(
             call.bot,
             partner["telegram_id"],
-            f"✅ Подтверждено!\n\nСегодня смотрите:\n🎬 «{movie['title']}»",
+            f"✅ <b>Подтверждено!</b>\n\n"
+            f"Сегодня смотрите:\n🎬 «{movie['title']}»",
         )
     await call.answer()
-
 
 # =========================================================
 #  🗑 УДАЛЕНИЕ ФИЛЬМА
