@@ -1,0 +1,1 @@
+ALTER TABLE movies ADD COLUMN reminder_sent_at TIMESTAMP;
